@@ -1,0 +1,39 @@
+# Secrets - NEVER commit these
+credentials.json
+token.json
+.env
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Local data (contains personal email info)
+data/
+drafts/*.md
+!drafts/.gitkeep
+vault/daily/*.md
+!vault/daily/.gitkeep
+vault/people/*.md
+!vault/people/.gitkeep
+vault/projects/*.md
+!vault/projects/.gitkeep
+vault/notes/*.txt
+vault/TODO.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archive (old iterations)
+archive/
