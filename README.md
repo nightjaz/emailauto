@@ -22,7 +22,7 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-4. Copy `.env.example` to `.env` and fill in values. No OpenAI API key is required if you want the rule-based version.
+4. Copy `.env.example` to `.env` and fill in values. Add your `OPENAI_API_KEY` for personalized AI-generated replies, or leave it blank to use rule-based templates.
 5. Initialize the local vault:
 
 ```powershell
@@ -115,6 +115,8 @@ Each task runs `python -m emailauto run`, writes a short brief into `vault/daily
 
 ## Notes
 
-- This version does not require an OpenAI API key.
-- Drafts are formal, professional, and conservative unless an AI provider is added.
-- Calendar is intentionally not used.
+- **OpenAI API key is optional but recommended:**
+  - **With key**: Personalized, context-aware replies using GPT-4o-mini (or your configured model)
+  - **Without key**: Professional template replies (functional but generic)
+- API calls are budgeted (default: 10 max per run) to control costs.
+- Calendar integration is intentionally excluded to limit scope.
