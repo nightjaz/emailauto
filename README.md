@@ -22,7 +22,7 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-4. Copy `.env.example` to `.env` and fill in values. No OpenAI API key is required for the current rule-based version.
+4. Copy `.env.example` to `.env` and fill in values. No OpenAI API key is required if you want the rule-based version.
 5. Initialize the local vault:
 
 ```powershell
