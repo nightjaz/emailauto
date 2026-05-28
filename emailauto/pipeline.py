@@ -3,33 +3,78 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime, parseaddr
 import re
+from typing import TYPE_CHECKING
 
 from .api_budget import ApiCallBudget, ApiCallBudgetExceeded
 from .config import Settings
-from .google_services import EmailThread, GoogleServices
 from .llm import DraftComposer
 from .vault import Vault, VaultMemory
+
+if TYPE_CHECKING:
+    from .google_services import EmailThread as GmailThread
+    from .outlook_services import EmailThread as OutlookThread
+    EmailThread = GmailThread | OutlookThread
+
+
+def _get_email_service(settings: Settings, api_budget: ApiCallBudget):
+    """Factory function to get email service based on provider config."""
+    if settings.email_provider == "outlook":
+        from .outlook_services import OutlookServices
+        if not settings.outlook_client_id:
+            raise ValueError("OUTLOOK_CLIENT_ID not configured")
+        return OutlookServices(
+            settings.outlook_client_id,
+            settings.outlook_tenant_id,
+            settings.outlook_token_path,
+            api_budget,
+            settings.outlook_refresh_token,
+        )
+    else:
+        from .google_services import GoogleServices
+        return GoogleServices(settings.credentials_path, settings.token_path, api_budget)
+
+
+def _get_email_query(settings: Settings) -> str:
+    """Get the appropriate email query based on provider."""
+    if settings.email_provider == "outlook":
+        return settings.outlook_query
+    return settings.gmail_query
+
+
+def _get_llm_api_key(settings: Settings) -> str | None:
+    """Get the appropriate LLM API key (prefer Gemini)."""
+    return settings.gemini_api_key or settings.openai_api_key
+
+
+def _get_llm_provider(settings: Settings) -> str:
+    """Determine LLM provider from settings."""
+    if settings.gemini_api_key:
+        return "gemini"
+    return "openai"
 
 
 def run_scan(settings: Settings, limit: int, dry_run: bool, create_drafts: bool) -> list[str]:
     vault = Vault(settings.vault_path)
     vault.init()
     api_budget = ApiCallBudget(settings.max_api_calls)
-    reserve_calls = 2 if create_drafts else 1 if settings.openai_api_key else 0
-    google = GoogleServices(settings.credentials_path, settings.token_path, api_budget)
+    llm_key = _get_llm_api_key(settings)
+    reserve_calls = 2 if create_drafts else 1 if llm_key else 0
+    email_service = _get_email_service(settings, api_budget)
     composer = DraftComposer(
-        settings.openai_api_key,
+        llm_key,
         settings.model,
         settings.default_tone,
         settings.user_name,
         api_budget,
+        _get_llm_provider(settings),
     )
     logs: list[str] = []
-    for thread_id in google.list_threads(settings.gmail_query, _thread_fetch_limit(limit, api_budget, reserve_calls)):
+    email_query = _get_email_query(settings)
+    for thread_id in email_service.list_threads(email_query, _thread_fetch_limit(limit, api_budget, reserve_calls)):
         if not api_budget.can_spend():
             logs.append(_api_budget_log(api_budget))
             break
-        thread = google.get_thread(thread_id)
+        thread = email_service.get_thread(thread_id)
         if not _should_create_draft(settings, thread):
             logs.append(f"[skip-no-draft] {thread.sender} | {thread.subject}")
             continue
@@ -54,14 +99,14 @@ def run_scan(settings: Settings, limit: int, dry_run: bool, create_drafts: bool)
             logs.append(f"[skip-existing-draft] {thread.sender} | {thread.subject}")
             continue
         try:
-            gmail_draft_id = google.create_draft_reply(thread, draft.body, settings.user_signature)
+            draft_id = email_service.create_draft_reply(thread, draft.body, settings.user_signature)
         except ApiCallBudgetExceeded as exc:
             logs.append(f"[api-budget-reached] {exc}")
             break
         _mark_draft_created(settings, thread.message_id)
         draft_path = _save_local_draft(settings, thread, draft.body, draft.priority)
         logs.append(
-            f"[gmail-draft:{gmail_draft_id}] [audit:{draft_path}] "
+            f"[draft:{draft_id}] [audit:{draft_path}] "
             f"{thread.sender} | {thread.subject} | {draft.priority}"
         )
     return logs
@@ -77,10 +122,11 @@ def run_brief(settings: Settings, email_limit: int = 20, label: str = "morning-b
 
 def run_workflow(settings: Settings, email_limit: int = 20, label: str = "morning-brief") -> tuple[str, list[str]]:
     api_budget = ApiCallBudget(settings.max_api_calls)
-    draft_reserve = 2 if settings.openai_api_key else 1
+    llm_key = _get_llm_api_key(settings)
+    draft_reserve = 2 if llm_key else 1
     threads = _fetch_pending_threads(settings, email_limit, api_budget, reserve_calls=draft_reserve)
     _update_markdown_vault(settings, threads)
-    draft_logs = _create_needed_gmail_drafts(settings, threads, api_budget)
+    draft_logs = _create_needed_drafts(settings, threads, api_budget)
     path = _write_brief(settings, threads, label, draft_logs)
     return str(path), draft_logs
 
@@ -90,31 +136,34 @@ def _fetch_pending_threads(
     email_limit: int,
     api_budget: ApiCallBudget,
     reserve_calls: int = 0,
-) -> list[EmailThread]:
-    google = GoogleServices(settings.credentials_path, settings.token_path, api_budget)
-    thread_ids = google.list_threads(settings.gmail_query, _thread_fetch_limit(email_limit, api_budget, reserve_calls))
-    threads: list[EmailThread] = []
+) -> list:
+    email_service = _get_email_service(settings, api_budget)
+    email_query = _get_email_query(settings)
+    thread_ids = email_service.list_threads(email_query, _thread_fetch_limit(email_limit, api_budget, reserve_calls))
+    threads = []
     for thread_id in thread_ids:
         if not api_budget.can_spend(1 + reserve_calls):
             break
-        threads.append(google.get_thread(thread_id))
+        threads.append(email_service.get_thread(thread_id))
     return threads
 
 
-def _create_needed_gmail_drafts(
+def _create_needed_drafts(
     settings: Settings,
-    threads: list[EmailThread],
+    threads: list,
     api_budget: ApiCallBudget,
 ) -> list[str]:
     vault = Vault(settings.vault_path)
     vault.init()
-    google = GoogleServices(settings.credentials_path, settings.token_path, api_budget)
+    email_service = _get_email_service(settings, api_budget)
+    llm_key = _get_llm_api_key(settings)
     composer = DraftComposer(
-        settings.openai_api_key,
+        llm_key,
         settings.model,
         settings.default_tone,
         settings.user_name,
         api_budget,
+        _get_llm_provider(settings),
     )
     logs: list[str] = []
     for thread in threads:
@@ -126,12 +175,19 @@ def _create_needed_gmail_drafts(
         memories = _memories_for_thread(settings, vault, thread)
         try:
             draft = composer.compose(thread, memories)
-            gmail_draft_id = google.create_draft_reply(thread, draft.body, settings.user_signature)
+
+            # Skip if AI determined no reply is needed
+            if not draft.body:
+                logs.append(f"No reply needed: {thread.sender} | {thread.subject} ({draft.summary})")
+                _mark_draft_created(settings, thread.message_id)
+                continue
+
+            draft_id = email_service.create_draft_reply(thread, draft.body, settings.user_signature)
         except ApiCallBudgetExceeded as exc:
             logs.append(f"Stopped at API budget: {exc}")
             break
         _mark_draft_created(settings, thread.message_id)
-        _save_local_draft(settings, thread, draft.body, draft.priority, gmail_draft_id)
+        _save_local_draft(settings, thread, draft.body, draft.priority, draft_id)
         vault.add_interaction(
             message_id=thread.message_id,
             sender=thread.sender,
@@ -139,7 +195,7 @@ def _create_needed_gmail_drafts(
             summary=draft.summary,
             project=draft.project or _detect_project(thread),
         )
-        logs.append(f"Created Gmail draft {gmail_draft_id}: {thread.sender} | {thread.subject}")
+        logs.append(f"Created draft: {thread.sender} | {thread.subject}")
     return logs
 
 
@@ -288,9 +344,9 @@ def _brief_points(thread: EmailThread, max_points: int = 6) -> list[str]:
         cleaned = _clean_brief_text(unit)
         if not cleaned:
             continue
-        score = _brief_unit_score(cleaned)
-        if _is_boilerplate_brief_line(cleaned) and score <= 0:
+        if _is_boilerplate_brief_line(cleaned):
             continue
+        score = _brief_unit_score(cleaned)
         if score > 0:
             scored.append((score, -index, cleaned))
 
@@ -356,14 +412,24 @@ def _is_repeated_brief_point(point: str, seen: set[str]) -> bool:
 
 
 def _is_boilerplate_brief_line(value: str) -> bool:
-    text = value.lower()
+    text = value.lower().strip().replace("'", "'").replace(""", '"').replace(""", '"')
     if re.match(r"^(to|from|date|subject|cc|bcc):\s", text):
         return True
     if text.startswith("hi @") or text.startswith("github, inc."):
         return True
+    if re.match(r"^(dear|hi|hello|hey)\s+\w+", text):
+        return True
+    if re.match(r"^(sir|madam|sir/madam|ma'am)", text):
+        return True
+    if re.match(r"^(good\s+)?(morning|afternoon|evening|day)", text):
+        return True
+    if len(text) < 15 and any(word in text for word in ["greetings", "regards", "thanks", "cheers"]):
+        return True
     boilerplate = [
         "dear students",
         "dear all",
+        "dear faculty",
+        "dear team",
         "good morning",
         "greetings",
         "please find",
@@ -371,20 +437,36 @@ def _is_boilerplate_brief_line(value: str) -> bool:
         "forwarded message",
         "regards",
         "best regards",
+        "warm regards",
+        "kind regards",
         "thank you",
+        "thanks and regards",
         "to view this email",
         "this communication is intended",
         "you can view",
         "read more about",
         "you're receiving this email",
         "you are receiving this email",
+        "you're receiving this",
+        "you received this",
+        "you have been made",
+        "click here",
+        "unsubscribe",
+        "sent from my",
+        "get outlook",
     ]
-    return any(text == marker or text.startswith(f"{marker} ") for marker in boilerplate)
+    return any(text == marker or text.startswith(f"{marker} ") or text.startswith(f"{marker},") for marker in boilerplate)
 
 
 def _brief_unit_score(value: str) -> int:
     text = value.lower()
     score = 0
+
+    if len(text) < 20:
+        score -= 3
+    elif len(text) > 50:
+        score += 1
+
     if re.search(r"\b\d{1,2}(st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", text):
         score += 4
     if re.search(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", text):
@@ -403,6 +485,13 @@ def _brief_unit_score(value: str) -> int:
         "session",
         "today",
         "tomorrow",
+        "required",
+        "must",
+        "action",
+        "respond",
+        "confirm",
+        "submit",
+        "complete",
     ]:
         if marker in text:
             score += 3
@@ -418,20 +507,29 @@ def _brief_unit_score(value: str) -> int:
         "google form",
         "uploaded",
         "campus",
+        "prize",
+        "winner",
+        "award",
+        "opportunity",
+        "internship",
+        "placement",
+        "interview",
     ]:
         if marker in text:
             score += 2
     if re.search(r"\bai\b", text):
         score += 2
-    for marker in ["organized by", "organised by", "imperial college"]:
+    for marker in ["organized by", "organised by", "imperial college", "bits pilani"]:
         if marker in text:
             score += 4
     if "?" in re.sub(r"https?://\S+", "", value):
         score += 2
+    if re.search(r"(rs\.?|inr|₹|\$)\s*[\d,]+", text):
+        score += 3
     return score
 
 
-def _write_brief(settings: Settings, threads: list[EmailThread], label: str, draft_logs: list[str]) -> str:
+def _write_brief(settings: Settings, threads: list, label: str, draft_logs: list[str]) -> str:
     settings.briefs_dir.mkdir(parents=True, exist_ok=True)
     grouped = {
         "Urgent Deadlines": [],
@@ -455,23 +553,39 @@ def _write_brief(settings: Settings, threads: list[EmailThread], label: str, dra
 
     title = label.replace("-", " ").title()
     lines = [f"# {title} - {datetime.now().strftime('%Y-%m-%d %H:%M')}", ""]
+
+    # Generate smart summaries using Gemini
+    summaries = {}
+    if settings.gemini_api_key and threads:
+        try:
+            from .clustering import EmailSummarizer
+            summarizer = EmailSummarizer(settings.gemini_api_key, settings.model)
+            summaries = summarizer.summarize_emails(threads)
+        except Exception:
+            pass
+
     for section in ("Urgent Deadlines", "Waiting On Me", "Important", "FYI"):
         lines.append(f"## {section}")
         if not grouped[section]:
             lines.append("- None.")
         for thread in grouped[section]:
-            lines.append(f"- **{_brief_sender_name(thread)}**: {_brief_subject(thread)}")
-            for point in _brief_points(thread):
-                lines.append(f"  - {point}")
+            summary = summaries.get(thread.message_id)
+            if summary:
+                from .clustering import EmailSummarizer
+                lines.extend(EmailSummarizer(None, "").format_summary_for_brief(thread, summary))
+            else:
+                lines.append(f"- **{_brief_sender_name(thread)}**: {_brief_subject(thread)}")
+                for point in _brief_points(thread):
+                    lines.append(f"  - {point}")
         lines.append("")
 
-    lines.append("## Gmail Drafts")
+    lines.append("## Drafts Created")
     if not draft_logs:
-        lines.append("- No new Gmail drafts created.")
+        lines.append("- No new drafts created.")
     else:
         for log in draft_logs:
             lines.append(f"- {log}")
-    lines.extend(["", "## Next Actions", "- Review Gmail drafts before sending.", "- Check TODO items for deadlines and pending replies.", ""])
+    lines.extend(["", "## Next Actions", "- Review drafts before sending.", "- Check TODO items for deadlines and pending replies.", ""])
 
     filename = f"{datetime.now().strftime('%Y-%m-%d')}-{_safe_filename(label)}.md"
     path = settings.briefs_dir / filename
@@ -479,7 +593,7 @@ def _write_brief(settings: Settings, threads: list[EmailThread], label: str, dra
     return str(path)
 
 
-def _update_markdown_vault(settings: Settings, threads: list[EmailThread]) -> None:
+def _update_markdown_vault(settings: Settings, threads: list) -> None:
     for folder in ("people", "projects", "daily", "notes"):
         (settings.vault_dir / folder).mkdir(parents=True, exist_ok=True)
     todo_items = {

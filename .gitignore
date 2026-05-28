@@ -37,3 +37,6 @@ Thumbs.db
 
 # Archive (old iterations)
 archive/
+
+# Boss instructions/feedback (local only)
+instrs/

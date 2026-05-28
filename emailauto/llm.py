@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .api_budget import ApiCallBudget
-from .google_services import EmailThread
 from .vault import VaultMemory
+
+if TYPE_CHECKING:
+    from .google_services import EmailThread as GmailThread
+    from .outlook_services import EmailThread as OutlookThread
+    EmailThread = GmailThread | OutlookThread
 
 
 @dataclass(frozen=True)
@@ -24,65 +30,102 @@ class DraftComposer:
         tone: str,
         user_name: str = "",
         api_budget: ApiCallBudget | None = None,
+        provider: str = "gemini",
     ):
         self.api_key = api_key
         self.model = model
         self.tone = tone
         self.user_name = user_name
         self.api_budget = api_budget
+        self.provider = provider
         self.client = None
+
         if api_key:
-            from openai import OpenAI
+            if provider == "gemini" or model.startswith("gemini"):
+                import google.generativeai as genai
+                genai.configure(api_key=api_key)
+                self.client = genai.GenerativeModel(model)
+                self.provider = "gemini"
+            else:
+                from openai import OpenAI
+                self.client = OpenAI(api_key=api_key)
+                self.provider = "openai"
 
-            self.client = OpenAI(api_key=api_key)
-
-    def compose(self, thread: EmailThread, memories: list[VaultMemory]) -> DraftResult:
+    def compose(self, thread, memories: list[VaultMemory]) -> DraftResult:
         if not self.client:
             return self._template_reply(thread, memories)
 
         memory_text = "\n".join(f"- {m.kind}:{m.key}: {m.note}" for m in memories) or "- none"
-        prompt = f"""
-You prepare formal, professional email replies for human approval. Never claim something is done unless the email proves it.
-If context is missing, write a cautious reply that says the user will check and get back.
-Use the known preferences and vault notes to personalize the reply. Refer to concrete dates, forms, links, deadlines, or requested actions from the email when useful.
-Do not draft replies for mass announcements as though the user has committed to participate; acknowledge and defer unless a clear response is required.
-Write in this tone: {self.tone}.
-User name: {self.user_name or "the sender of this assistant"}
+        prompt = f"""You are drafting an email reply for {self.user_name or 'the user'}.
 
-Known preferences:
+FIRST, analyze the email:
+1. What TYPE of email is this? (personal request, mass announcement, newsletter, direct question, FYI, etc.)
+2. What SPECIFICALLY is the sender asking for or informing about?
+3. Does this email ACTUALLY need a reply from me, or is it just informational?
+
+THEN, if a reply is appropriate:
+- Address the SPECIFIC ask (don't write generic "thank you for your email")
+- If they asked a question, answer it or say you'll check
+- If they requested action, confirm you'll do it or explain if you can't
+- If it's an announcement/newsletter/mass email, either don't reply OR just acknowledge briefly
+
+Tone: {self.tone}
+
+Context about sender/projects:
 {memory_text}
 
-Email:
+EMAIL TO REPLY TO:
 From: {thread.sender}
-To: {thread.to}
-Cc: {thread.cc}
 Subject: {thread.subject}
 Date: {thread.date}
-Body:
-{thread.body[:6000]}
 
-Return JSON with:
-body: the draft reply only
-summary: one sentence about what the email needs
-project: likely project name or null
-priority: low, normal, or high
+{thread.body[:5000]}
+
+Return ONLY valid JSON:
+{{
+  "needs_reply": true/false,
+  "email_type": "what type of email this is",
+  "what_they_want": "specific thing they're asking/informing",
+  "body": "your draft reply (empty string if needs_reply is false)",
+  "summary": "one sentence: what this email needs from you",
+  "project": "project name or null",
+  "priority": "low/normal/high"
+}}
+
+If needs_reply is false, body should be empty string "".
 """
         if self.api_budget:
-            self.api_budget.consume("openai.chat.completions.create")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-        data = json.loads(response.choices[0].message.content)
-        return DraftResult(
-            body=str(data["body"]).strip(),
-            summary=str(data.get("summary", "")).strip(),
-            project=data.get("project"),
-            priority=str(data.get("priority", "normal")).strip(),
-        )
+            self.api_budget.consume("llm.generate")
+        try:
+            if self.provider == "gemini":
+                response = self.client.generate_content(prompt)
+                text = response.text
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                )
+                text = response.choices[0].message.content
 
-    def brief(self, threads: list[EmailThread], events: list[dict], recent_memory: list[object]) -> str:
+            data = _parse_json_response(text)
+
+            body = str(data.get("body", "")).strip()
+            needs_reply = data.get("needs_reply", True)
+
+            if not needs_reply or not body:
+                body = ""
+
+            return DraftResult(
+                body=body,
+                summary=str(data.get("summary", data.get("what_they_want", ""))).strip(),
+                project=data.get("project"),
+                priority=str(data.get("priority", "normal")).strip(),
+            )
+        except Exception:
+            return self._template_reply(thread, memories)
+
+    def brief(self, threads: list, events: list[dict], recent_memory: list[object]) -> str:
         if not self.client:
             return _template_brief(threads, events)
 
@@ -96,10 +139,9 @@ priority: low, normal, or high
         )
         memory = "\n".join(str(dict(row)) for row in recent_memory)
         if self.api_budget:
-            self.api_budget.consume("openai.chat.completions.create")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": f"""
+            self.api_budget.consume("llm.generate")
+
+        prompt = f"""
 Create a concise morning brief for today.
 
 Include:
@@ -116,11 +158,21 @@ Calendar:
 
 Recent vault interactions:
 {memory}
-"""}],
-        )
-        return response.choices[0].message.content.strip()
+"""
+        try:
+            if self.provider == "gemini":
+                response = self.client.generate_content(prompt)
+                return response.text.strip()
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return response.choices[0].message.content.strip()
+        except Exception:
+            return _template_brief(threads, events)
 
-    def _template_reply(self, thread: EmailThread, memories: list[VaultMemory]) -> DraftResult:
+    def _template_reply(self, thread, memories: list[VaultMemory]) -> DraftResult:
         priority = _priority_from_thread(thread)
         greeting = _greeting_for(thread.sender)
         action = _action_sentence(thread, memories)
@@ -138,7 +190,17 @@ Recent vault interactions:
         )
 
 
-def _template_brief(threads: list[EmailThread], events: list[dict]) -> str:
+def _parse_json_response(text: str) -> dict:
+    """Parse JSON from LLM response, handling markdown code blocks."""
+    text = text.strip()
+    if text.startswith("```"):
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if match:
+            text = match.group(1).strip()
+    return json.loads(text)
+
+
+def _template_brief(threads: list, events: list[dict]) -> str:
     lines = ["# Morning Brief", ""]
     lines.append("## Meetings")
     if events:
@@ -155,7 +217,7 @@ def _template_brief(threads: list[EmailThread], events: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _priority_from_thread(thread: EmailThread) -> str:
+def _priority_from_thread(thread) -> str:
     text = f"{thread.subject} {thread.snippet} {thread.body}".lower()
     high_markers = [
         "urgent",
@@ -186,7 +248,7 @@ def _greeting_for(sender: str) -> str:
     return f"Dear {name},"
 
 
-def _action_sentence(thread: EmailThread, memories: list[VaultMemory] | None = None) -> str:
+def _action_sentence(thread, memories: list[VaultMemory] | None = None) -> str:
     text = f"{thread.subject} {thread.snippet} {thread.body}".lower()
     memory_text = " ".join(memory.note.lower() for memory in memories or [])
     if "never send automatically" in memory_text:
