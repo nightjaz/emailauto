@@ -17,13 +17,21 @@ on:
         default: 'manual-brief'
 
 env:
+  # Gmail (current setup)
+  GOOGLE_TOKEN: ${{ secrets.GOOGLE_TOKEN }}
+
+  # Outlook (for future use)
   OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
   OUTLOOK_TENANT_ID: ${{ secrets.OUTLOOK_TENANT_ID }}
   OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
+
+  # LLM
   GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-  EMAILAUTO_PROVIDER: outlook
-  EMAILAUTO_OUTLOOK_QUERY: "isRead eq false"
-  EMAILAUTO_MODEL: "gemini-2.0-flash"
+
+  # Config
+  EMAILAUTO_PROVIDER: gmail
+  EMAILAUTO_GMAIL_QUERY: "is:unread"
+  EMAILAUTO_MODEL: "gemini-flash-latest"
 
 jobs:
   generate-brief:
@@ -58,6 +66,10 @@ jobs:
               echo "label=evening-debrief" >> $GITHUB_OUTPUT
             fi
           fi
+
+      - name: Setup Gmail credentials
+        run: |
+          echo '${{ secrets.GOOGLE_TOKEN }}' > token.json
 
       - name: Initialize vault
         run: python -m emailauto init
