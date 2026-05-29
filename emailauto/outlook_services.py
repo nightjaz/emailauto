@@ -14,7 +14,7 @@ from .api_budget import ApiCallBudget
 
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-SCOPES = ["Mail.Read", "Mail.ReadWrite", "offline_access"]
+SCOPES = ["Mail.Read", "Mail.ReadWrite"]
 
 
 @dataclass(frozen=True)
