@@ -30,7 +30,7 @@ env:
   # Config
   EMAILAUTO_PROVIDER: gmail
   EMAILAUTO_GMAIL_QUERY: "is:unread"
-  EMAILAUTO_MODEL: "gemini-flash-latest"
+  EMAILAUTO_MODEL: "gemini-2.5-flash-lite"
 
 jobs:
   generate-brief:
